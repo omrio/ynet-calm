@@ -1,76 +1,144 @@
-import json, re, html, urllib.request, urllib.parse, datetime, email.utils, xml.etree.ElementTree as ET
+"""Collect Ynet homepage article headlines, with RSS as a safe fallback."""
+from html.parser import HTMLParser
 from pathlib import Path
-FEEDS = {'חדשות':'2', 'כלכלה':'6', 'תרבות':'538', 'בריאות':'1208', 'טכנולוגיה':'544', 'רכב':'550', 'אוכל':'975'}
-BASE='https://www.ynet.co.il/Integration/StoryRss{}.xml'
-OUT=Path(__file__).parent/'site'/'articles.json'
+from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
+import datetime as dt
+import email.utils
+import html
+import json
+import re
+import xml.etree.ElementTree as ET
+
+HOME = 'https://www.ynet.co.il/'
+FEEDS = {'חדשות':'2','כלכלה':'6','תרבות':'538','בריאות':'1208','טכנולוגיה':'544','אוכל':'975'}
+OUT = Path(__file__).parent / 'site' / 'articles.json'
+NOW = dt.datetime.now(dt.timezone.utc)
+
+
+def fetch(url):
+    req = Request(url, headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36', 'Accept-Language':'he-IL,he;q=0.9'})
+    with urlopen(req, timeout=30) as res:
+        return res.read()
+
 
 def clean(s):
-    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]*>', '', s or ''))).strip()
+    return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]*>', ' ', s or ''))).strip()
 
-def local(tag): return tag.rsplit('}',1)[-1]
 
-def content(el,name):
-    for x in el:
-        if local(x.tag)==name:return ''.join(x.itertext()).strip()
-    return ''
+def canonical(href):
+    p = urlsplit(urljoin(HOME, html.unescape(href or '')))
+    if p.hostname not in ('www.ynet.co.il','ynet.co.il'):
+        return ''
+    if not (re.search(r'/article/',p.path,re.I) or re.search(r'/articles/\d',p.path,re.I)):
+        return ''
+    if re.search(r'/(?:sports?|wheels?|vehicle|vehicles|auto|cars?|motoring|judaism|jewish|yahadut)/',p.path,re.I):
+        return ''
+    return urlunsplit(('https','www.ynet.co.il',p.path,'',''))
 
-def image_of(item):
-    for x in item.iter():
-        name=local(x.tag).lower()
-        if name in ('enclosure','thumbnail','content'):
-            url=x.attrib.get('url','')
-            if url.startswith('http') and (name=='thumbnail' or 'image' in x.attrib.get('type','') or re.search(r'\.(jpg|jpeg|png|webp)',url,re.I)):
-                return url
-    desc=content(item,'description')
-    m=re.search(r'<img[^>]+src=[\'\"]([^\'\"]+)',desc,re.I)
-    return html.unescape(m.group(1)) if m else ''
 
-all_items=[]; failures=[]
-for category, code in FEEDS.items():
-    url=BASE.format(code)
-    try:
-        req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 (compatible; personal-news-reader/1.0)','Accept':'application/rss+xml,application/xml,text/xml,*/*'})
-        with urllib.request.urlopen(req,timeout=25) as response: raw=response.read()
-        root=ET.fromstring(raw)
-        entries=[x for x in root.iter() if local(x.tag) in ('item','entry')]
-        if not entries: raise ValueError('No feed entries')
-        for item in entries:
-            title=clean(content(item,'title'))
-            link=content(item,'link')
-            if not link:
-                for x in item:
-                    if local(x.tag)=='link': link=x.attrib.get('href',''); break
-            link=html.unescape(link)
-            if not (title and link.startswith('https://')):
-                if link.startswith('http://'): link='https://'+link[7:]
-                else: continue
-            parsed=urllib.parse.urlparse(link)
-            if not (parsed.hostname == 'ynet.co.il' or parsed.hostname.endswith('.ynet.co.il')): continue
-            date=content(item,'pubDate') or content(item,'published') or content(item,'updated')
-            try: ts=email.utils.parsedate_to_datetime(date).timestamp()
-            except Exception:
-                try: ts=datetime.datetime.fromisoformat(date.replace('Z','+00:00')).timestamp()
-                except Exception: ts=0
-            all_items.append({'title':title,'url':link,'section':category,'summary':clean(content(item,'description'))[:220], 'image':image_of(item),'timestamp':int(ts)})
-        print(category, len(entries))
-    except Exception as exc:
-        failures.append(f'{category}: {exc}')
-        print('FAILED',category,exc)
-old=[]
-if OUT.exists():
-    try: old=json.loads(OUT.read_text('utf-8')).get('articles',[])
-    except Exception: pass
-if not all_items and old:
-    all_items=old
-elif all_items and failures:
-    existing={x['url'] for x in all_items}
-    failed_sections={x.split(':')[0] for x in failures}
-    all_items.extend(x for x in old if x['section'] in failed_sections and x['url'] not in existing)
-unique={}
-for x in all_items:
-    unique.setdefault(x['url'],x)
-articles=sorted(unique.values(),key=lambda x:x['timestamp'],reverse=True)[:300]
-if not articles: raise SystemExit('No articles; refusing to publish empty data')
-payload={'updated_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'count':len(articles),'errors':failures,'articles':articles}
-OUT.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding='utf-8')
-print('Written',len(articles),'articles')
+class Homepage(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.current = None
+        self.heading = 0
+        self.entries = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == 'a':
+            self.finish()
+            self.current = {'url':canonical(attrs.get('href','')), 'text':[], 'heading':[], 'title':attrs.get('title',''), 'image':''}
+        elif self.current is not None:
+            if re.fullmatch(r'h[1-6]',tag):
+                self.heading += 1
+            if tag == 'img' and not self.current['image']:
+                self.current['image'] = attrs.get('src') or attrs.get('data-src') or ''
+
+    def handle_data(self, data):
+        if self.current:
+            self.current['text'].append(data)
+            if self.heading:
+                self.current['heading'].append(data)
+
+    def handle_endtag(self, tag):
+        if re.fullmatch(r'h[1-6]',tag):
+            self.heading = max(0,self.heading-1)
+        if tag == 'a':
+            self.finish()
+
+    def finish(self):
+        if not self.current:
+            return
+        c = self.current
+        self.current = None
+        self.heading = 0
+        title = clean(' '.join(c['heading'])) or clean(c['title']) or clean(' '.join(c['text']))
+        if not c['url'] or not (12 <= len(title) <= 220):
+            return
+        self.entries.append({'title':title,'url':c['url'],'section':'חדשות','summary':'','image':urljoin(HOME,c['image']) if c['image'] else '', 'timestamp':int(NOW.timestamp())})
+
+
+def homepage_items():
+    parser = Homepage()
+    parser.feed(fetch(HOME).decode('utf-8','replace'))
+    parser.finish()
+    distinct = {}
+    for item in parser.entries:
+        distinct.setdefault(item['url'],item)
+    found = list(distinct.values())
+    if len(found) < 15:
+        raise ValueError(f'Only {len(found)} headline links extracted from homepage')
+    return found
+
+
+def rss_items():
+    results, errors = [], []
+    for section, code in FEEDS.items():
+        try:
+            root = ET.fromstring(fetch('https://www.ynet.co.il/Integration/StoryRss'+code+'.xml'))
+            for item in root.iter():
+                if item.tag.rsplit('}',1)[-1] != 'item':
+                    continue
+                values = {child.tag.rsplit('}',1)[-1]:''.join(child.itertext()).strip() for child in item}
+                title = clean(values.get('title',''))
+                url = canonical(values.get('link',''))
+                if not title or not url:
+                    continue
+                try:
+                    timestamp = int(email.utils.parsedate_to_datetime(values.get('pubDate','')).timestamp())
+                except Exception:
+                    timestamp = 0
+                results.append({'title':title,'url':url,'section':section,'summary':clean(values.get('description',''))[:220], 'image':'','timestamp':timestamp})
+        except Exception as exc:
+            errors.append(f'{section}: {exc}')
+    distinct = {}
+    for item in results:
+        distinct.setdefault(item['url'],item)
+    return sorted(distinct.values(),key=lambda x:x['timestamp'],reverse=True), errors
+
+
+errors=[]
+try:
+    articles = homepage_items()
+    source = 'ynet-homepage'
+except Exception as exc:
+    errors.append('Homepage: '+str(exc))
+    articles, rss_errors = rss_items()
+    errors.extend(rss_errors)
+    source = 'rss-fallback'
+
+if not articles and OUT.exists():
+    articles = json.loads(OUT.read_text('utf-8')).get('articles',[])
+    source = 'previous-data'
+# Apply exclusions even to preserved data from a previous deployment.
+articles = [item for item in articles
+            if item.get('section') not in ('רכב', 'יהדות', 'ספורט')
+            and canonical(item.get('url', ''))]
+if not articles:
+    raise SystemExit('No usable articles; aborting deployment')
+
+OUT.parent.mkdir(parents=True,exist_ok=True)
+OUT.write_text(json.dumps({'updated_at':NOW.isoformat(),'count':len(articles),'source':source,'errors':errors,'articles':articles[:300]},ensure_ascii=False,indent=2),encoding='utf-8')
+print('Published',min(len(articles),300),'articles; source:',source)
+if errors: print('Warnings:',*errors,sep='\n')
