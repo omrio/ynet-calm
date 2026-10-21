@@ -16,6 +16,13 @@ FEEDS = {'חדשות':'2','כלכלה':'6','תרבות':'538','בריאות':'12
 OUT = Path(__file__).parent/'site'/'articles.json'
 NOW = dt.datetime.now(dt.timezone.utc)
 BLOCK_SECTION = re.compile(r'/(?:sports?|wheels?|vehicle|vehicles|auto|cars?|motoring|judaism|jewish|yahadut)(?:/|$)', re.I)
+# Exclude site/legal/support pages and classified listings even when ynet gives them an article-shaped URL.
+NON_EDITORIAL = re.compile(r'(?:מדיניות\s+פרטיות|תנאי\s+שימוש|הצהרת\s+נגישות|אודות\s+(?:ynet|האתר)|צור\s+קשר|דווחו\s+לנו|דרוש(?:ים|ות|\/ה|\/ת)|דרושה|דרושים|דרוש\/ה|משרות\s+פתוחות|פרסם\s+אצלנו|פרסום\s+באתר)', re.I)
+NON_EDITORIAL_PATH = re.compile(r'(?:privacy|terms(?:-of-use)?|accessibility|contact-us|about-us|classifieds|jobs|career|advertis)', re.I)
+
+def editorial(title, url):
+    return bool(title and not NON_EDITORIAL.search(title) and not NON_EDITORIAL_PATH.search(up.urlsplit(url).path))
+
 HEADERS = {'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36','Accept-Language':'he-IL,he;q=0.9'}
 
 
@@ -59,36 +66,76 @@ def section_from(value):
 
 
 class Homepage(HTMLParser):
+    """Read both classic text links and image-only links with sibling headlines."""
+    CARD_TAGS = {'article', 'li', 'section'}
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.active=None; self.heading=0; self.entries=[]
-    def handle_starttag(self,tag,attrs):
-        a=dict(attrs)
-        if tag=='a':
-            self.finish()
-            self.active={'url':article_url(a.get('href','')),'text':[],'heads':[],
-                         'title':a.get('title',''),'image':'','section':a.get('data-category','')}
-        elif self.active is not None:
-            if re.fullmatch(r'h[1-6]',tag):self.heading+=1
-            if tag in ('img','source') and not self.active['image']:
-                src=a.get('data-src') or a.get('src') or a.get('data-original') or a.get('data-lazy-src')
-                if not src and a.get('srcset'):
-                    src=a['srcset'].split(',')[0].strip().split(' ')[0]
-                self.active['image']=image_url(src)
-    def handle_data(self,data):
-        if self.active is not None:
-            self.active['text'].append(data)
-            if self.heading:self.active['heads'].append(data)
-    def handle_endtag(self,tag):
-        if re.fullmatch(r'h[1-6]',tag):self.heading=max(0,self.heading-1)
-        if tag=='a':self.finish()
+        self.active = None
+        self.heading = 0
+        self.entries = []
+        self.frames = []
+        self.recent_heading = ''
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        frame = {'tag': tag, 'classes': a.get('class', ''), 'head': [], 'text': [],
+                 'links': [], 'image': '', 'section': a.get('data-category', '')}
+        if tag == 'a':
+            frame['url'] = article_url(a.get('href', ''))
+            frame['title'] = a.get('title', '') or a.get('aria-label', '')
+        if tag in ('img', 'source'):
+            src = (a.get('data-src') or a.get('src') or a.get('data-original')
+                   or a.get('data-lazy-src') or '')
+            if not src and a.get('srcset'):
+                src = a['srcset'].split(',')[0].strip().split(' ')[0]
+            frame['image'] = image_url(src)
+        self.frames.append(frame)
+
+    def handle_data(self, data):
+        if not data.strip(): return
+        for f in self.frames:
+            if len(f['text']) < 80: f['text'].append(data)
+            if f['tag'] in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+                f['head'].append(data)
+
+    def handle_endtag(self, tag):
+        if not self.frames: return
+        # Ignore unexpected closing tags without collapsing whole DOM state.
+        index = next((i for i in range(len(self.frames)-1, -1, -1)
+                      if self.frames[i]['tag'] == tag), None)
+        if index is None: return
+        while len(self.frames) > index:
+            self._finish_frame()
+
+    def _finish_frame(self):
+        f = self.frames.pop()
+        parent = self.frames[-1] if self.frames else None
+        if f['tag'] == 'a' and f.get('url'):
+            title = clean(f.get('title') or ' '.join(f['head']) or ' '.join(f['text']))
+            if 12 <= len(title) <= 210 and editorial(title, f['url']):
+                self.entries.append({'title': title, 'url': f['url'],
+                    'section': section_from(f['section']) or section_from(f['url']) or 'כללי',
+                    'summary': '', 'image': f['image'], 'timestamp': 0})
+            if parent is not None:
+                parent['links'].append({'url': f['url'], 'title': title, 'image': f['image']})
+        if parent is not None:
+            if f['image'] and not parent['image']: parent['image'] = f['image']
+            if f['tag'] in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6') and f['head']:
+                parent['head'].append(clean(' '.join(f['head'])))
+            if f['links']: parent['links'].extend(f['links'])
+        if f['tag'] in self.CARD_TAGS or re.search(r'(?:slot|card|item|article|story|teaser|headline|title|component)', f['classes'], re.I):
+            # A wrapper containing one linked article, a headline outside the anchor and an image
+            # is a common pattern in ynet's non-news sections.
+            urls = list(dict.fromkeys(x['url'] for x in f['links']))
+            heading = next((h for h in f['head'] if 12 <= len(h) <= 210), '')
+            if len(urls) == 1 and heading and editorial(heading, urls[0]):
+                link = next(x for x in f['links'] if x['url'] == urls[0])
+                self.entries.append({'title': heading, 'url': urls[0],
+                    'section': section_from(f['section']) or section_from(urls[0]) or 'כללי',
+                    'summary': '', 'image': link['image'] or f['image'], 'timestamp': 0})
+
     def finish(self):
-        if self.active is None:return
-        a=self.active;self.active=None;self.heading=0
-        title=clean(' '.join(a['heads'])) or clean(a['title']) or clean(' '.join(a['text']))
-        if not a['url'] or not 12<=len(title)<=210:return
-        self.entries.append({'title':title,'url':a['url'],'section':section_from(a['section']) or section_from(a['url']) or 'כללי',
-                             'summary':'','image':a['image'],'timestamp':0})
+        while self.frames: self._finish_frame()
 
 
 class Metadata(HTMLParser):
@@ -126,7 +173,7 @@ def rss_items():
                     x=next((c for c in item if c.tag.rsplit('}',1)[-1]==name),None)
                     return ''.join(x.itertext()).strip() if x is not None else ''
                 url=article_url(child('link'));title=clean(child('title'))
-                if not url or not title:continue
+                if not url or not title or not editorial(title,url):continue
                 try:stamp=int(email.utils.parsedate_to_datetime(child('pubDate')).timestamp())
                 except Exception:stamp=0
                 img=''
@@ -149,7 +196,13 @@ def build():
     try:
         parser=Homepage();parser.feed(fetch(HOME));parser.finish()
         unique={}
-        for a in parser.entries:unique.setdefault(a['url'],a)
+        for a in parser.entries:
+            if a['url'] not in unique:
+                unique[a['url']]=a
+            else:
+                current=unique[a['url']]
+                if len(a['title']) > len(current['title']) and len(a['title'])<=175:current['title']=a['title']
+                if not current['image'] and a['image']:current['image']=a['image']
         articles=list(unique.values())
         if len(articles)<15:raise ValueError(f'Only {len(articles)} homepage links')
         source='ynet-homepage'
@@ -173,7 +226,7 @@ def build():
         errors.append(f'Homepage: {ex}')
         articles=sorted(rss.values(),key=lambda a:a['timestamp'],reverse=True)[:150]
         source='rss-fallback'
-    articles=[a for a in articles if a['section'] not in ('ספורט','רכב','יהדות') and not BLOCK_SECTION.search(up.urlsplit(a['url']).path)]
+    articles=[a for a in articles if editorial(a['title'],a['url']) and a['section'] not in ('ספורט','רכב','יהדות') and not BLOCK_SECTION.search(up.urlsplit(a['url']).path)]
     if not articles and OUT.exists():
         articles=json.loads(OUT.read_text('utf-8')).get('articles',[])
         source='previous-data'
